@@ -1,7 +1,6 @@
 """
 PiMPC - Parallel-in-Horizon MPC Solver (PyTorch)
 
-Direct translation of the Julia PiMPC solver.
 Supports CPU and GPU (CUDA) via PyTorch, with optional batched solving
 across multiple initial conditions in parallel.
 
@@ -168,17 +167,22 @@ class Model:
     # ------------------------------------------------------------------
     # solve_batch  (multiple initial conditions in parallel)
     # ------------------------------------------------------------------
-    def solve_batch(self, x0, u0, yref, uref, w=None, verbose: bool = False) -> Results:
+    def solve_batch(self, x0, u0, yref, uref, w=None,
+                    umin_steps=None, umax_steps=None,
+                    verbose: bool = False) -> Results:
         """
         Solve MPC for a batch of initial conditions simultaneously.
 
         Parameters
         ----------
-        x0   : (batch, nx)
-        u0   : (batch, nu)
-        yref : (batch, ny)  or  (ny,)  [broadcast]
-        uref : (batch, nu)  or  (nu,)  [broadcast]
-        w    : (batch, nx)  or  (nx,)  [broadcast], default zeros
+        x0         : (batch, nx)
+        u0         : (batch, nu)
+        yref       : (batch, ny)  or  (batch, ny, Np)  — constant or per-step output ref
+        uref       : (batch, nu)  or  (batch, nu, Np)  — constant or per-step input ref
+        w          : (batch, nx)  or  (nx,)  [broadcast], default zeros
+        umin_steps : (batch, nu, Np) per-step lower bounds on u, or None
+        umax_steps : (batch, nu, Np) per-step upper bounds on u, or None
+                     Overrides the constant umin/umax from setup() for the Z-projection.
         """
         assert self.is_setup, "Call setup() first."
 
@@ -198,11 +202,20 @@ class Model:
         if x0.dim() == 1: x0 = x0.unsqueeze(0)
         batch = x0.shape[0]
         if u0.dim()   == 1: u0   = u0.unsqueeze(0).expand(batch, -1)
+        # yref/uref: keep 3-D (B, n, Np) if provided, else broadcast 1-D/2-D
         if yref.dim() == 1: yref = yref.unsqueeze(0).expand(batch, -1)
         if uref.dim() == 1: uref = uref.unsqueeze(0).expand(batch, -1)
         if w.dim()    == 1: w    = w.unsqueeze(0).expand(batch, -1)
 
-        x, u, du, info, _ = _solve_batch(self, x0, u0, yref, uref, w, verbose=verbose)
+        if umin_steps is not None:
+            umin_steps = umin_steps.to(device=self.device, dtype=self.dtype)
+        if umax_steps is not None:
+            umax_steps = umax_steps.to(device=self.device, dtype=self.dtype)
+
+        x, u, du, info, _ = _solve_batch(self, x0, u0, yref, uref, w,
+                                          umin_steps=umin_steps,
+                                          umax_steps=umax_steps,
+                                          verbose=verbose)
         return Results(x=x, u=u, du=du, **info)
 
 
@@ -419,6 +432,7 @@ def _solve(m: Model, x0, u0, yref, uref, w,
 # ======================================================================
 
 def _solve_batch(m: Model, x0, u0, yref, uref, w,
+                 umin_steps=None, umax_steps=None,
                  warm_vars=None, verbose: bool = False):
     """
     Batched ADMM.  All tensors have a leading batch dimension B.
@@ -460,6 +474,20 @@ def _solve_batch(m: Model, x0, u0, yref, uref, w,
     xmin_bar = torch.cat([m.xmin, m.umin])  # (nx_bar,)
     xmax_bar = torch.cat([m.xmax, m.umax])
 
+    # Per-step bounds: (B, nx_bar, Np) — only used when umin_steps is provided.
+    # The x-part of the bounds stays constant (±inf); only the u-part varies.
+    if umin_steps is not None:
+        # umin_steps: (B, nu, Np)
+        xmin_bar_steps = torch.empty(B, nx_bar, Np, device=dev, dtype=dt)
+        xmax_bar_steps = torch.empty(B, nx_bar, Np, device=dev, dtype=dt)
+        xmin_bar_steps[:, :nx, :] = m.xmin.view(1, nx, 1).expand(B, nx, Np)
+        xmax_bar_steps[:, :nx, :] = m.xmax.view(1, nx, 1).expand(B, nx, Np)
+        xmin_bar_steps[:, nx:, :] = umin_steps
+        xmax_bar_steps[:, nx:, :] = umax_steps
+    else:
+        xmin_bar_steps = None
+        xmax_bar_steps = None
+
     # ---- Preconditioning ----
     if m.precond:
         E      = torch.sqrt((A_bar.T @ A_bar).diag())
@@ -486,15 +514,32 @@ def _solve_batch(m: Model, x0, u0, yref, uref, w,
     Q_bar_N[:nx, :nx] = C_part.T @ m.Wf @ C_part
     Q_bar_N[nx:, nx:] = m.Wu
 
-    # q_bar: (B, nx_bar)
-    q_bar   = torch.cat([
-        (C_part.T @ m.Wy @ yref.T).T,      # (B, nx)
-        (m.Wu @ uref.T).T                   # (B, nu)
-    ], dim=1)
-    q_bar_N = torch.cat([
-        (C_part.T @ m.Wf @ yref.T).T,
-        (m.Wu @ uref.T).T
-    ], dim=1)
+    # Per-step references:  yref (B, ny) or (B, ny, Np),  uref likewise.
+    # q_bar  : (B, nx_bar, Np)  — per-step linear cost vectors
+    # q_bar_N: (B, nx_bar, 1)   — terminal
+    _CW  = C_part.T @ m.Wy   # (nx, nx)
+    _CWf = C_part.T @ m.Wf   # (nx, nx)
+    if yref.dim() == 3:
+        # yref: (B, ny, Np),  uref: (B, nu, Np)
+        q_y   = _CW @ yref            # (B, nx, Np)
+        q_u   = m.Wu @ uref           # (B, nu, Np)
+        q_bar = torch.cat([q_y, q_u], dim=1)  # (B, nx_bar, Np)
+        # Terminal: last column of yref / uref
+        q_bar_N = torch.cat([
+            (_CWf @ yref[:, :, -1:]),   # (B, nx, 1)
+            (m.Wu @ uref[:, :, -1:]),   # (B, nu, 1)
+        ], dim=1)                       # (B, nx_bar, 1)
+    else:
+        # Constant reference (original path)  yref: (B, ny)
+        q_bar_const = torch.cat([
+            (_CW @ yref.T).T,           # (B, nx)
+            (m.Wu @ uref.T).T           # (B, nu)
+        ], dim=1)                       # (B, nx_bar)
+        q_bar = q_bar_const.unsqueeze(2).expand(B, nx_bar, Np).contiguous()
+        q_bar_N = torch.cat([
+            (_CWf @ yref.T).T,
+            (m.Wu @ uref.T).T
+        ], dim=1).unsqueeze(2)          # (B, nx_bar, 1)
     R_bar = m.Wdu
 
     # ---- Precomputed inverses ----
@@ -554,7 +599,7 @@ def _solve_batch(m: Model, x0, u0, yref, uref, w,
         # X interior  (columns 1..Np-1)
         if Np > 1:
             # rhs_mid: (B, nx_bar, Np-1)
-            rhs_mid = (q_bar.unsqueeze(2)
+            rhs_mid = (q_bar[:, :, :Np-1]
                        + rho * (_Z[:, :, :Np-1] - _T[:, :, :Np-1]
                                 + A_bar.T @ (_Z[:, :, 1:Np] - _V[:, :, 1:Np]
                                              + _La[:, :, 1:Np]
@@ -563,7 +608,7 @@ def _solve_batch(m: Model, x0, u0, yref, uref, w,
             X[:, :, 1:Np] = H_A @ rhs_mid
 
         # X terminal
-        rhs_N = q_bar_N.unsqueeze(2) + rho * (_Z[:, :, Np-1:Np] - _T[:, :, Np-1:Np])
+        rhs_N = q_bar_N + rho * (_Z[:, :, Np-1:Np] - _T[:, :, Np-1:Np])
         X[:, :, Np:Np+1] = H_AN @ rhs_N
 
         # BU: (B, nx_bar, Np), AX: (B, nx_bar, Np)
@@ -573,7 +618,10 @@ def _solve_batch(m: Model, x0, u0, yref, uref, w,
         ew = e_b.expand(B, -1, Np) + w_b.expand(B, -1, Np)
 
         Z  = (2.0 * (X[:, :, 1:Np+1] + _T) + BU + _Be + AX + ew - _La) / 3.0
-        Z  = torch.clamp(Z, xmin_bar.view(1, -1, 1), xmax_bar.view(1, -1, 1))
+        if xmin_bar_steps is not None:
+            Z  = torch.clamp(Z, xmin_bar_steps, xmax_bar_steps)
+        else:
+            Z  = torch.clamp(Z, xmin_bar.view(1, -1, 1), xmax_bar.view(1, -1, 1))
         V  = 0.5 * (Z + BU + _Be - AX - ew + _La)
 
         Theta  = _T  + X[:, :, 1:Np+1] - Z
